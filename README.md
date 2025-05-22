@@ -6,6 +6,7 @@ TopoRGB is a DEM in the human-readable PNG format.
 TopoRGB is an alternative to TerrainRGB or Terrrarium.
 - TerrainRGB & Terrarium is NOT human readable but TopoRGB is.
 - TopoRGB is human readable but also readable by multimodal AIs.
+TopoRGB is a DEM readable to everyone - humans, machines, and multimodal AIs.
 
 ## Resolution
 TopoRGB has approx. 1-m height resolution.
