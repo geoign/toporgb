@@ -14,11 +14,17 @@ TopoRGB theoretically has 1-m height resolution.
 
 By default, TopoRGB PNG is decoded to GeoTIFF in integer format.
 
+
 ## GeoTIFF -> TopoRGB PNG + JSON
 `python toporgb_codec.py *.tif`
 
 ## TopoRGB PNG (+ optionally JSON) -> GeoTIFF
 `python toporgb_codec.py *.png`
+
+## Demo
+Download sample_gebco_dem_1.png and sample_gebco_dem_1.json.
+And run python toporgb_codec.py *.png
+
 
 ## Who made this?
 Fumihiko Ikegami (Ikegami GeoResearch)
