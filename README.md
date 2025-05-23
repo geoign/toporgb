@@ -1,6 +1,6 @@
 # TopoRGB
 TopoRGB is a DEM in the human-readable PNG format. 
-![Decode this!](./sample.png)
+![Decode this!](./sample_gebco_dem_1.png)
 
 ## Why TopoRGB?
 TopoRGB is an alternative to TerrainRGB or Terrrarium.
@@ -16,8 +16,10 @@ By default, TopoRGB PNG is decoded to GeoTIFF in integer format.
 
 ## Usage
 Encoding: python toporgb_code.py *.tif
+GeoTIFF -> TopoRGB PNG + JSON
 
 Decoding: python toporgb_code.py *.png
+TopoRGB PNG (+ optionally JSON) -> GeoTIFF
 
 ## Who made this?
 Fumihiko Ikegami (Ikegami GeoResearch)
