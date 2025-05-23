@@ -23,6 +23,7 @@ By default, TopoRGB PNG is decoded to GeoTIFF in integer format.
 
 ## Demo
 Download sample_gebco_dem_1.png and sample_gebco_dem_1.json.
+
 And run python toporgb_codec.py *.png
 
 
