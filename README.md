@@ -26,6 +26,11 @@ By default, TopoRGB PNG is decoded to GeoTIFF in integer format.
 2. Run python toporgb_codec.py *.png
 3. You will get the intact GeoTIFF DEM.
 
+## --fuzzy decoding
+When --fuzzy option enabled, the color does not need to match to the palette exactly.
+
+This allows decoding AI-generated TopoRGB and lossy format (like JPEG) TopoRGB.
+
 ## Who made this?
 Fumihiko Ikegami (Ikegami GeoResearch)
 
