@@ -22,10 +22,9 @@ By default, TopoRGB PNG is decoded to GeoTIFF in integer format.
 `python toporgb_codec.py *.png`
 
 ## Demo
-Download sample_gebco_dem_1.png and sample_gebco_dem_1.json.
-
-And run python toporgb_codec.py *.png
-
+1. Download *sample_gebco_dem_1.png* and *sample_gebco_dem_1.json*.
+2. Run python toporgb_codec.py *.png
+3. You will get the intact GeoTIFF DEM.
 
 ## Who made this?
 Fumihiko Ikegami (Ikegami GeoResearch)
@@ -33,4 +32,4 @@ Fumihiko Ikegami (Ikegami GeoResearch)
 ## Acknowledgements
 OpenAI ChatGPT o3 - I made the idea. He wrote the code.
 
-GEBCO 2024 Grid - What the sample image is made of.
+GEBCO 2024 Grid - What the sample image is made of. Resized to 1% size.
