@@ -10,15 +10,17 @@ TopoRGB is an alternative to TerrainRGB or Terrrarium.
 TopoRGB is a DEM readable to everyone - humans, machines, and multimodal AIs.
 
 ## Resolution
-TopoRGB has theoretically 1-m height resolution.
+TopoRGB theoretically has 1-m height resolution.
 
 By default, TopoRGB PNG is decoded to GeoTIFF in integer format.
 
 ## Usage
 Encoding: python toporgb_code.py *.tif
+
 GeoTIFF -> TopoRGB PNG + JSON
 
 Decoding: python toporgb_code.py *.png
+
 TopoRGB PNG (+ optionally JSON) -> GeoTIFF
 
 ## Who made this?
