@@ -1,256 +1,272 @@
 #!/usr/bin/env python3
 """
-toporgb_codec.py – Encode GeoTIFF DEMs to TopoRGB PNG + JSON metadata, or decode back into GeoTIFF DEMs.
+TopoRGB Codec: Encode GeoTIFF DEMs to TopoRGB PNG + JSON metadata, or decode back into GeoTIFF DEMs.
 Features:
-  • Forward and inverse look-up tables for height ↔ RGB mapping via perceptual Lab interpolation.
-  • Optional "fuzzy" color matching mode for robust decoding with slight color variations (e.g., AI-generated images, JPEG compression).
-  • JSON metadata includes affine transform and CRS WKT for full geo-referencing.
+  - Forward & inverse LUTs via perceptual Lab interpolation.
+  - Optional fuzzy color matching (nearest‐neighbor) for slight color variations.
+  - JSON metadata contains affine transform & CRS for full geo-referencing.
 
 Usage:
-  Encoding:
-    python toporgb_codec.py "./dem_tiles/*.tif"
-      - Input: GeoTIFF DEM (*.tif or *.tiff)
-      - Output: TopoRGB PNG (*.png) + JSON metadata (*.json)
+  # Encode DEMs to PNG + metadata:
+  python toporgb_codec.py encode "./dem_tiles/*.tif" [--palette NAME]
 
-  Decoding:
-    python toporgb_codec.py "./png_tiles/*.png" [--fuzzy]
-      - Input: TopoRGB PNG (*.png) + JSON metadata (*.json)
-      - Output: GeoTIFF DEM (*.tif, int16)
-      - Use --fuzzy to enable nearest-neighbor color matching for non-exact LUT entries.
-
-Requirements:
-  • Python 3.7+
-  • rasterio
-  • Pillow
-  • scikit-image
-  • scipy (for KDTree in fuzzy mode)
-  • tqdm (optional, for progress bars)
-
-Geo-reference:
-  When encoding, the source affine transform and CRS are saved into JSON. On decoding, these are restored if available; otherwise, a default north-up transform is used.
+  # Decode PNG + metadata back to DEM GeoTIFFs:
+  python toporgb_codec.py decode "./png_tiles/*.png" [--palette NAME] [--fuzzy]
 """
 
 from __future__ import annotations
-import sys, glob, json, zlib, base64, warnings, rasterio
+import sys
+import glob
+import json
+import zlib
+import base64
+import warnings
 from pathlib import Path
 from functools import lru_cache
-from typing import Sequence, Iterable, Tuple
-from scipy.spatial import cKDTree  # KDTree for fuzzy color matching
+from typing import Sequence, Optional, Tuple
+
 import numpy as np
 from PIL import Image
+from scipy.spatial import cKDTree
+import rasterio
 from rasterio.transform import Affine
+from rasterio.crs import CRS
 import argparse
-try:
-    from tqdm import tqdm
-except ImportError:
-    tqdm = lambda x, **k: x  # fallback if tqdm is not installed
 
-# -------------------------------------------------------------------- #
-# 1. TopoRGB palette definition (must remain consistent across encoder/decoder)
-# -------------------------------------------------------------------- #
-_SEGMENTS: Tuple[Tuple[int, str], ...] = (
-    (-11_000, "#081d58"), (-6_000, "#225ea8"), (-1_000, "#41b6c4"),
-    (      0, "#66c2a5"), (   500, "#238b45"), ( 2_000, "#fdae61"),
-    (  4_500, "#a6611a"), ( 9_000, "#ffffff"),
-)
+from color_palettes import get_palette, list_palettes
 
-try:
-    from skimage import color  # for perceptual Lab ⇄ sRGB conversion
-except ImportError:
-    sys.exit("scikit-image is required – install with:  pip install scikit-image")
+# ---------------------------------------------------------------------
+# Utilities: Base64 + zlib for embedding LUT in metadata
+# ---------------------------------------------------------------------
+def _compress_bytes(data: bytes) -> str:
+    """Compress and base64-encode bytes."""
+    return base64.b64encode(zlib.compress(data, level=9)).decode()
 
-# -------------------------------------------------------------------- #
-# 2. Forward LUT: height16 → RGB   • size = 65 536 × 3 (uint8)
-# -------------------------------------------------------------------- #
-@lru_cache(maxsize=1)
-def lut_forward() -> np.ndarray:
-    """Return uint8[65536,3] mapping unsigned 16-bit heights to sRGB."""
-    h_pts = np.array([h for h, _ in _SEGMENTS], np.float32)
-    rgb_pts = np.array(
-        [tuple(int(c[i:i+2], 16) / 255 for i in (1, 3, 5)) for _, c in _SEGMENTS],
-        np.float32,
-    )
-    lab_pts = color.rgb2lab(rgb_pts.reshape(-1, 1, 3)).reshape(-1, 3)
 
-    h16 = np.arange(65_536, dtype=np.float32)
-    lab  = np.empty((65_536, 3), np.float32)
-    h_m  = h16 - 11_000.0  # convert to metres
-
-    for i in range(len(_SEGMENTS) - 1):
-        h0, h1 = h_pts[i : i + 2]
-        mask = (h_m >= h0) & (h_m <= h1)
-        t = (h_m[mask] - h0) / (h1 - h0)
-        lab[mask] = (1 - t)[:, None] * lab_pts[i] + t[:, None] * lab_pts[i + 1]
-
-    rgb = color.lab2rgb(lab.reshape(-1, 1, 3)).reshape(-1, 3)
-    return np.clip(np.round(rgb * 255), 0, 255).astype(np.uint8)
-
-# -------------------------------------------------------------------- #
-# 3. Inverse LUT: exact RGB → height16   • size = 256³ (uint16)
-# -------------------------------------------------------------------- #
-@lru_cache(maxsize=1)
-def lut_inverse() -> np.ndarray:
-    """Return uint16[256,256,256] mapping sRGB triplets to height16, with 65535 as sentinel."""
-    rgb = lut_forward()
-    inv = np.full((256, 256, 256), 65_535, dtype=np.uint16)
-    inv[rgb[:, 0], rgb[:, 1], rgb[:, 2]] = np.arange(65_536, dtype=np.uint16)
-    return inv
-
-# -------------------------------------------------------------------- #
-# 4. KDTree for fuzzy matching: nearest RGB neighbor → height16
-# -------------------------------------------------------------------- #
-@lru_cache(maxsize=1)
-def lut_kdtree():
-    """
-    Return (tree, heights):
-      - tree: cKDTree built over forward LUT RGB points
-      - heights: uint16 array of corresponding height16 values
-    """
-    rgb = lut_forward().astype(np.float32)
-    heights = np.arange(65_536, dtype=np.uint16)
-    tree = cKDTree(rgb)
-    return tree, heights
-
-# -------------------------------------------------------------------- #
-# 5. Base64 + zlib utilities for embedding LUT in JSON metadata
-# -------------------------------------------------------------------- #
-def to_b64z(data: bytes) -> str:
-    return base64.b64encode(zlib.compress(data, 9)).decode()
-
-def from_b64z(txt: str) -> bytes:
+def _decompress_bytes(txt: str) -> bytes:
+    """Base64-decode and decompress bytes."""
     return zlib.decompress(base64.b64decode(txt))
 
-# -------------------------------------------------------------------- #
-# 6. Core converters: height ↔ PNG
-# -------------------------------------------------------------------- #
+# ---------------------------------------------------------------------
+# LUT Selection: CLI override > embedded LUT > named palette > default
+# ---------------------------------------------------------------------
 
-def height_to_h16(dem_m: np.ndarray) -> np.ndarray:
-    """Convert metres to uint16 with +11000m offset."""
-    return np.clip(np.round(dem_m + 11_000.0), 0, 65_535).astype(np.uint16)
+def select_lut(cli_name: Optional[str], metadata: Optional[dict]) -> np.ndarray:
+    """Return forward LUT (shape=(65536,3)) based on CLI, metadata, or default."""
+    if cli_name:
+        return get_palette(cli_name)
+
+    if metadata:
+        if (b64 := metadata.get("lut_b64")):
+            raw = _decompress_bytes(b64)
+            return np.frombuffer(raw, np.uint8).reshape(65536, 3)
+        if (name := metadata.get("palette")):
+            return get_palette(name)
+
+    # default palette
+    return get_palette("classic")
+
+# ---------------------------------------------------------------------
+# Forward LUT (height_index -> RGB)
+# ---------------------------------------------------------------------
+
+_SELECTED_PALETTE: str  # set in main()
+
+@lru_cache(maxsize=1)
+def lut_forward() -> np.ndarray:
+    """Return the selected forward LUT array (uint8 RGB rows)."""
+    return get_palette(_SELECTED_PALETTE)
+
+# ---------------------------------------------------------------------
+# Inverse LUT (exact color match) and KDTree (fuzzy match)
+# ---------------------------------------------------------------------
+# Cache full-cube inverse LUT for exact match (≈33 MB), keyed on bytes
+@lru_cache(maxsize=None)
+def _build_inverse_lut(lut_bytes: bytes) -> np.ndarray:
+    """Return uint16[256,256,256] mapping sRGB triplets to height_index."""
+    lut = np.frombuffer(lut_bytes, np.uint8).reshape(65536, 3)
+    inv = np.full((256, 256, 256), 65535, dtype=np.uint16)
+    indices = np.arange(lut.shape[0], dtype=np.uint16)
+    inv[lut[:, 0], lut[:, 1], lut[:, 2]] = indices
+    return inv
+
+# Cache KDTree lookup for fuzzy matching, keyed on bytes
+@lru_cache(maxsize=None)
+def _build_kdtree(lut_bytes: bytes) -> tuple[cKDTree, np.ndarray]:
+    """Return (KDTree, heights[]) for nearest-neighbor lookup."""
+    arr = np.frombuffer(lut_bytes, np.uint8).reshape(65536, 3).astype(np.float32)
+    heights = np.arange(arr.shape[0], dtype=np.uint16)
+    tree = cKDTree(arr)
+    return tree, heights
+
+# ---------------------------------------------------------------------
+# Core Conversions: height <-> uint16 <-> RGB
+# ---------------------------------------------------------------------
+
+def metres_to_index(dem_m: np.ndarray) -> np.ndarray:
+    """Convert metre-array to uint16 index with +11,000m offset."""
+    return np.clip(np.round(dem_m + 11000.0), 0, 65535).astype(np.uint16)
 
 
-def encode_dem_to_png(dem: np.ndarray) -> Image.Image:
-    """Encode DEM metres array to TopoRGB PIL Image."""
-    rgb = lut_forward()[height_to_h16(dem)]
+def index_to_metres(index: np.ndarray) -> np.ndarray:
+    """Convert uint16 index back to metre-array (int16 or float32)."""
+    return index.astype(np.float32) - 11000.0
+
+
+def encode_dem_to_image(dem: np.ndarray) -> Image.Image:
+    """Encode DEM (metres) to TopoRGB PIL Image."""
+    lut = lut_forward()
+    indices = metres_to_index(dem)
+    rgb = lut[indices]
     return Image.fromarray(rgb, mode="RGB")
 
 
-def decode_png_to_dem(
-    rgb_img: Image.Image,
+def decode_image_to_dem(
+    img: Image.Image,
     *,
-    dtype=np.int16,
-    fuzzy: bool = False
+    dtype: type = np.int16,
+    fuzzy: bool = False,
+    lut: np.ndarray,
 ) -> np.ndarray:
-    """
-    Decode TopoRGB PIL Image back to DEM.
-    If fuzzy=True, perform nearest-neighbor search for colors not found exactly in LUT.
-    """
-    rgb = np.asarray(rgb_img.convert("RGB"), np.uint8)
-    inv = lut_inverse()
-    h16 = inv[rgb[..., 0], rgb[..., 1], rgb[..., 2]]
+    """Decode TopoRGB PIL Image to DEM metres array."""
+    rgb = np.asarray(img.convert("RGB"), np.uint8)
+    # exact match via cached full-cube LUT inverse
+    index = _build_inverse_lut(lut.tobytes())[rgb[..., 0], rgb[..., 1], rgb[..., 2]]
 
-    if fuzzy:
-        mask = (h16 == 65535)
-        if mask.any():
-            tree, heights = lut_kdtree()
-            pts = rgb[mask].reshape(-1, 3).astype(np.float32)
-            _, idxs = tree.query(pts)
-            h16[mask] = heights[idxs]
+    if fuzzy and (mask := (index == 65535)).any():
+        # fuzzy match via cached KDTree
+        tree, heights = _build_kdtree(lut.tobytes())
+        pts = rgb[mask].reshape(-1, 3).astype(np.float32)
+        _, idxs = tree.query(pts)
+        index[mask] = heights[idxs]
 
-    if dtype == np.int16:
-        return (h16.astype(np.int32) - 11_000).astype(np.int16)
-    return h16.astype(np.float32) - 11_000.0
+    metres = index_to_metres(index)
+    return metres.astype(dtype)
 
-# -------------------------------------------------------------------- #
-# 7. I/O helpers and batch routines with JSON I/O
-# -------------------------------------------------------------------- #
+# ---------------------------------------------------------------------
+# File I/O: glob helpers and batch routines
+# ---------------------------------------------------------------------
 
-def tif_paths(glob_pattern: str) -> Sequence[Path]:
-    return [Path(p) for p in glob.glob(glob_pattern) if p.lower().endswith((".tif", ".tiff"))]
+def glob_paths(pattern: str, exts: Tuple[str, ...]) -> list[Path]:
+    """Return sorted Paths matching glob pattern and extensions."""
+    return sorted(
+        Path(p) for p in glob.glob(pattern) if p.lower().endswith(exts)
+    )
 
-def png_paths(glob_pattern: str) -> Sequence[Path]:
-    return [Path(p) for p in glob.glob(glob_pattern) if p.lower().endswith(".png")]
 
-def batch_encode(tifs: Iterable[Path]) -> None:
-    for tif in tqdm(list(tifs), desc="Encoding"):
+def batch_encode(pattern: str) -> None:
+    """Encode all GeoTIFF DEMs matching pattern."""
+    tifs = glob_paths(pattern, (".tif", ".tiff"))
+    if not tifs:
+        raise FileNotFoundError("No GeoTIFF files found for encoding.")
+
+    for tif in tifs:
         with rasterio.open(tif) as src:
             dem = src.read(1).astype(np.float32)
-            transform = src.transform
-            crs = src.crs
-        img = encode_dem_to_png(dem)
-        png_path = tif.with_suffix(".png")
-        img.save(png_path, optimize=True, compress_level=9)
+            transform, crs = src.transform, src.crs
 
-        payload = {
+        img = encode_dem_to_image(dem)
+        png_file = tif.with_suffix(".png")
+        img.save(png_file, optimize=True, compress_level=9)
+
+        metadata = {
             "width": dem.shape[1],
             "height": dem.shape[0],
-            "transform": [transform.a, transform.b, transform.c,
-                          transform.d, transform.e, transform.f],
-            "crs_wkt": crs.to_wkt() if crs is not None else None,
-            "lut_b64": to_b64z(lut_forward().tobytes()),
-            "nudged_b64": to_b64z(np.array([], dtype=np.uint32).tobytes()),
+            "transform": list(transform[:6]),
+            "crs_wkt": crs.to_wkt() if crs else None,
+            "lut_b64": _compress_bytes(lut_forward().tobytes()),
+            "palette": _SELECTED_PALETTE,
         }
-        tif.with_suffix(".json").write_text(json.dumps(payload, separators=(",", ":")))
+        json_file = tif.with_suffix(".json")
+        json_file.write_text(json.dumps(metadata, separators=(",", ":")))
 
-def batch_decode(pngs: Iterable[Path], *, fuzzy: bool = False) -> None:
-    for png in tqdm(list(pngs), desc="Decoding"):
-        dem = decode_png_to_dem(Image.open(png), dtype=np.int16, fuzzy=fuzzy)
-        json_path = png.with_suffix('.json')
-        if json_path.exists():
-            meta = json.loads(json_path.read_text())
-            t = meta.get('transform')
-            crs_wkt = meta.get('crs_wkt')
+
+def batch_decode(pattern: str, fuzzy: bool) -> None:
+    """Decode all TopoRGB PNGs matching pattern back to GeoTIFF DEMs."""
+    pngs = glob_paths(pattern, (".png",))
+    if not pngs:
+        raise FileNotFoundError("No PNG files found for decoding.")
+
+    for png in pngs:
+        meta_file = png.with_suffix(".json")
+        metadata = json.loads(meta_file.read_text()) if meta_file.exists() else None
+
+        lut = select_lut(_SELECTED_PALETTE, metadata)
+        dem = decode_image_to_dem(
+            Image.open(png), dtype=np.int16, fuzzy=fuzzy, lut=lut
+        )
+
+        if metadata:
+            t = metadata.get("transform")
             transform = Affine(*t) if t else Affine(1, 0, 0, 0, -1, dem.shape[0])
-            crs = rasterio.crs.CRS.from_wkt(crs_wkt) if crs_wkt else None
+            crs = CRS.from_wkt(metadata.get("crs_wkt")) if metadata.get("crs_wkt") else None
         else:
-            warnings.warn(f"No JSON for {png.name}: using default north-up transform/CRS")
+            warnings.warn(f"Missing JSON for {png.name}, using default transform/CRS.")
             transform = Affine(1, 0, 0, 0, -1, dem.shape[0])
             crs = None
 
-        out_tif = png.with_suffix('.tif')
+        out_tif = png.with_suffix(".tif")
         with rasterio.open(
-            out_tif, 'w', driver='GTiff', width=dem.shape[1], height=dem.shape[0],
-            count=1, dtype='int16', compress='LZW', predictor=2,
-            transform=transform, crs=crs
+            out_tif,
+            "w",
+            driver="GTiff",
+            width=dem.shape[1],
+            height=dem.shape[0],
+            count=1,
+            dtype="int16",
+            compress="LZW",
+            predictor=2,
+            transform=transform,
+            crs=crs,
         ) as dst:
             dst.write(dem, 1)
 
-# -------------------------------------------------------------------- #
-# 8. Argument parsing and main entry point
-# -------------------------------------------------------------------- #
+# ---------------------------------------------------------------------
+# CLI: Argument parsing and main
+# ---------------------------------------------------------------------
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="TopoRGB codec: encode GeoTIFFs or decode TopoRGB PNGs."
     )
-    parser.add_argument(
-        "pattern",
-        help="Glob pattern for input files (*.tif[f] for encode, *.png for decode)"
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    enc = sub.add_parser("encode", help="Encode GeoTIFF DEMs to TopoRGB PNGs")
+    enc.add_argument("pattern", help="Glob for input .tif/.tiff files")
+    enc.add_argument(
+        "--palette",
+        default="classic",
+        choices=list_palettes(),
+        help="Name of color palette",
     )
-    parser.add_argument(
+
+    dec = sub.add_parser("decode", help="Decode TopoRGB PNGs to GeoTIFF DEMs")
+    dec.add_argument("pattern", help="Glob for input .png files")
+    dec.add_argument(
+        "--palette",
+        default="cubehelix16x16",
+        choices=list_palettes(),
+        help="Name of color palette",
+    )
+    dec.add_argument(
         "--fuzzy",
         action="store_true",
-        help="Enable fuzzy color matching on decode (nearest neighbor lookup)"
+        help="Enable fuzzy color matching for slight color variations",
     )
+
     return parser.parse_args()
+
 
 def main() -> None:
     args = parse_args()
-    pattern = args.pattern
+    global _SELECTED_PALETTE
+    _SELECTED_PALETTE = args.palette
 
-    if pattern.lower().endswith((".tif", ".tiff")):
-        files = tif_paths(pattern)
-        if not files:
-            sys.exit("No GeoTIFF found for encoding.")
-        batch_encode(files)
-    elif pattern.lower().endswith(".png"):
-        files = png_paths(pattern)
-        if not files:
-            sys.exit("No PNG found for decoding.")
-        batch_decode(files, fuzzy=args.fuzzy)
-    else:
-        sys.exit(
-            "Please supply a *.tif[f] pattern for encoding or *.png for decoding."
-        )
+    if args.command == "encode":
+        batch_encode(args.pattern)
+    elif args.command == "decode":
+        batch_decode(args.pattern, fuzzy=args.fuzzy)
+
 
 if __name__ == "__main__":
     main()
