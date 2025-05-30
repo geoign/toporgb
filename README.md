@@ -33,7 +33,7 @@ By default, TopoRGB PNG is decoded to GeoTIFF in integer format.
 ## DeepWiki Page
 Devin automatically produced DeepWiki page of this project. Very informative.
 
-![https://deepwiki.com/geoign/toporgb/1-overview](https://deepwiki.com/geoign/toporgb/1-overview)
+https://deepwiki.com/geoign/toporgb/1-overview
 
 ## Who made this?
 Fumihiko Ikegami (Ikegami GeoResearch)
