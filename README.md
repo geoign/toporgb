@@ -30,6 +30,11 @@ By default, TopoRGB PNG is decoded to GeoTIFF in integer format.
 - When --fuzzy option enabled, the color does not need to match to the palette exactly.
 - This allows decoding AI-generated TopoRGB and lossy format (like JPEG) TopoRGB.
 
+## DeepWiki Page
+Devin automatically produced DeepWiki page of this project. Very informative.
+
+![https://deepwiki.com/geoign/toporgb/1-overview](https://deepwiki.com/geoign/toporgb/1-overview)
+
 ## Who made this?
 Fumihiko Ikegami (Ikegami GeoResearch)
 
